@@ -85,11 +85,6 @@ void setup() {
   //CONFIGURAR HORA
   rtc.adjust(DateTime(2025, 3, 25, 10, 53, 0));  //YYYY, MM, DD, HH, MM, SS
   //%%%%%%%%%%%%%%%
-  //-------------------------------------------
-  // Inicializar contadores
-  contadorBoton = 0;
-  contadorInfra = 0;
-//%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   //TAREAS
 //-------------------------------------------------------------
   xTaskCreatePinnedToCore(Temperatura,"ReadDHT",4096,NULL,configMAX_PRIORITIES-1,&TaskTemperatura,app_cpu);
