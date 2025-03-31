@@ -1,180 +1,320 @@
-/**
- * @file main.cpp
- * @brief Programa para leer sensores y gestionar tareas en un ESP32.
- *
- *
- * Este programa utiliza el sensor DHT11 para medir temperatura y humedad,
- * un sensor de luz, y cuenta con un reloj en tiempo real (RTC) para obtener
- * la fecha y la hora. Implementa tareas concurrentes mediante FreeRTOS
- * para manejar las lecturas de sensores y el control de LEDs, tiene alarmas
- *la linea 103 del codigo solo se usa para configurar la hora, una vez realizado
- *Se puede eliminar o en si defecto comentar 
+/*
+ * PROYECTO: Sistema de Monitoreo Ambiental con ESP32
+ * AUTOR: [Tu nombre]
+ * FECHA: [Fecha]
+ * DESCRIPCIÓN: 
+ *   - Lectura de temperatura, humedad y luminosidad
+ *   - Registro temporal con RTC
+ *   - Gestión de energía con modos sleep
+ *   - Comunicación serial con protocolo personalizado
+ *   - Sistema multi-tarea con FreeRTOS
  */
 
+// Bibliotecas ================================================================
 #include "DHT.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <RTClib.h>
 
-/** @brief Tipo de sensor DHT utilizado. */
-#define DHTTYPE DHT11
+// Configuración Hardware =====================================================
+#define DHTTYPE DHT11            // Tipo de sensor DHT
+#define DHTPIN 15                // GPIO para DHT11
+#define pinAlarma 2              // GPIO para buzzer
+#define pinLedAlarma 4           // GPIO LED indicador de error
+#define pinLed 5                 // GPIO LED estado del sistema
+#define PinLuz 34                // GPIO sensor LDR (ADC1_CH6)
+#define PinBoton 33              // GPIO pulsador (INPUT_PULLUP)
+#define PinInfra  25             // GPIO sensor infrarrojo
 
-// Definición de pines
-#define DHTPIN 15        ///< Pin del sensor DHT11
-#define pinAlarma 2      ///< Pin de la alarma
-#define pinLedAlarma 4   ///< Pin del LED de la alarma
-#define pinLed 5         ///< Pin del LED indicador
-#define PinLuz 34        ///< Pin del sensor de luz
-#define PinBoton 33      ///< Pin del botón de interrupción
-#define PinInfra 25      ///< Pin del sensor infrarrojo
+// Objetos ====================================================================
+DHT dht(DHTPIN, DHTTYPE);        // Objeto DHT
+RTC_DS3231 rtc;                  // Objeto RTC
 
-/** @brief Objeto del sensor DHT11. */
-DHT dht(DHTPIN, DHTTYPE);
-
-/** @brief Objeto para manejar el RTC DS3231. */
-RTC_DS3231 rtc;
-
-/** @struct SensoresData
- *  @brief Estructura para almacenar los valores de los sensores.
+// Estructura de Datos ========================================================
+/**
+ * @struct SensoresData
+ * @brief Almacena todos los datos del sistema y sus representaciones formateadas
+ * 
+ * @field ValueTemperatura   Valor float de temperatura
+ * @field ValueHumedad      Valor float de humedad
+ * @field ValueLuz          Valor entero de luminosidad
+ * @field year...second     Componentes temporales del RTC
+ * @field date              Cadena fecha formateada (DD/MM/AAAA)
+ * @field time              Cadena hora formateada (HH:MM:SS)
+ * @field temp              Temperatura formateada (TT.TT)
+ * @field hum               Humedad formateada (HH.HH)
+ * @field luz               Luminosidad formateada (LLLL)
+ * @field contadorBotonStr  Pulsaciones formateadas (BBBB)
+ * @field contadorInfraStr  Detecciones IR formateadas (IIII)
  */
 typedef struct {
-  float ValueTemperatura; ///< Valor de la temperatura en grados Celsius
-  float ValueHumedad;     ///< Valor de la humedad relativa en porcentaje
-  int ValueLuz;          ///< Valor de la luz en unidades arbitrarias
-  int year, month, day, hour, minute, second; ///< Fecha y hora
-  char date[11]; ///< Fecha formateada ("DD/MM/AAAA")
-  char time[9];  ///< Hora formateada ("HH:MM:SS")
-  char temp[6];  ///< Temperatura formateada ("HH.HH")
-  char hum[6];   ///< Humedad formateada ("HH.HH")
-  char luz[5];   ///< Luz formateada ("LLLL")
-  char contadorBotonStr[5]; ///< Contador de pulsaciones
-  char contadorInfraStr[5]; ///< Contador de interrupciones del sensor infrarrojo
+    // Valores crudos
+    float ValueTemperatura;
+    float ValueHumedad;
+    int ValueLuz;
+    int year, month, day, hour, minute, second;
+    
+    // Cadenas formateadas
+    char date[11];          // "DD/MM/AAAA"
+    char time[9];           // "HH:MM:SS"
+    char temp[6];           // "TT.TT"
+    char hum[6];            // "HH.HH"
+    char luz[5];            // "LLLL"
+    char contadorBotonStr[5]; // "BBBB"
+    char contadorInfraStr[5]; // "IIII"
 } SensoresData;
 
-/** @brief Instancia de la estructura para almacenar los datos de los sensores. */
-SensoresData Cadena;
+SensoresData Cadena;  // Instancia global de la estructura
 
-// Variables globales, Interrpcion y ajuste para erroes de pulsacion del boton y sensor inflarojo 
-volatile int contadorBoton = 0; ///< Contador de pulsaciones del botón
-volatile int contadorInfra = 0; ///< Contador de interrupciones del sensor infrarrojo
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; ///< Mutex para acceso a variables compartidas
+// Variables Globales =========================================================
+volatile int contadorBoton = 0;  // Contador de pulsaciones (atomic)
+volatile int contadorInfra = 0;  // Contador detecciones IR (atomic)
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Para operaciones atómicas
 
-// Configuración del núcleo para tareas FreeRTOS
+// Configuración FreeRTOS =====================================================
 #if CONFIG_FREERTOS_UNICORE
-static const BaseType_t app_cpu = 0;
+    static const BaseType_t app_cpu = 0;
 #else
-static const BaseType_t app_cpu = 1;
+    static const BaseType_t app_cpu = 1;
 #endif
 
-// Definición de retardos en milisegundos
-static const int rate_LED = 500;
-static const int rate_LUZ = 1700;
-static const int rate_Temperatura = 2300;
-static const int rate_Humedad = 2600;
-static const int rate_DISplay = 10000;
+// Temporizaciones (ms) =======================================================
+static const int rate_LED = 500;        // Parpadeo LED estado
+static const int rate_LUZ = 1700;       // Lectura luminosidad
+static const int rate_Temperatura = 2300;// Lectura temperatura
+static const int rate_Humedad = 2600;   // Lectura humedad
+static const int rate_DISplay = 10000;  // Envío de datos
 
-// Handles de tareas FreeRTOS
+// Handles de Tareas ==========================================================
 TaskHandle_t TaskTemperatura = NULL;
 TaskHandle_t TaskHumedad = NULL;
 TaskHandle_t TaskLED = NULL;
 TaskHandle_t TaskLUZ = NULL;
 TaskHandle_t TaskDisplay = NULL;
-TaskHandle_t TaskSleep = NULL;
+TaskHandle_t TaskSleep;
 
-/**
- * @brief Configuración inicial del ESP32.
- */
+// Setup =======================================================================
 void setup() {
-  Serial.begin(115200);
-  dht.begin();
+    Serial.begin(115200);
+    
+    // Inicialización sensores
+    dht.begin();
+    pinMode(PinLuz, INPUT);
+    
+    // Configuración LEDs y alarmas
+    pinMode(pinAlarma, OUTPUT);
+    pinMode(pinLedAlarma, OUTPUT);
+    pinMode(pinLed, OUTPUT);
+    
+    // Configuración entradas
+    pinMode(PinBoton, INPUT_PULLUP);
+    pinMode(PinInfra, INPUT_PULLUP);
+    
+    // Inicialización RTC
+    Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+    if (!rtc.begin()) {
+        Serial.println("Error al iniciar RTC");
+        while (1);
+    }
 
-  pinMode(pinAlarma, OUTPUT);
-  pinMode(pinLedAlarma, OUTPUT);
-  pinMode(pinLed, OUTPUT);
-  pinMode(PinLuz, INPUT);
-  pinMode(PinBoton, INPUT_PULLUP);
-  pinMode(PinInfra, INPUT_PULLUP);
+    // Creación de Tareas =====================================================
+    xTaskCreatePinnedToCore(
+        Temperatura,        // Función
+        "ReadDHT",          // Nombre
+        4096,               // Stack size
+        NULL,               // Parámetros
+        configMAX_PRIORITIES - 1,  // Prioridad
+        &TaskTemperatura,   // Handle
+        app_cpu);           // Core
 
-  Wire.begin(21, 22);
-  if (!rtc.begin()) {
-    Serial.println("Error al iniciar RTC");
-    while (1);
-  }
-  rtc.adjust(DateTime(2025, 3, 25, 10, 53, 0));
-
-  // Crear tareas
-  xTaskCreatePinnedToCore(Temperatura, "ReadDHT", 4096, NULL, configMAX_PRIORITIES-1, &TaskTemperatura, app_cpu);
-  xTaskCreatePinnedToCore(Humedad, "ReadDHT", 4096, NULL, configMAX_PRIORITIES-1, &TaskHumedad, app_cpu);
-  xTaskCreatePinnedToCore(LED, "HighLED", 1024, NULL, configMAX_PRIORITIES-1, &TaskLED, app_cpu);
-  xTaskCreatePinnedToCore(LUZ, "ReadLUZ", 1024, NULL, configMAX_PRIORITIES-1, &TaskLUZ, app_cpu);
-  xTaskCreatePinnedToCore(DisplayData, "ReadDHT", 4096, NULL, configMAX_PRIORITIES-1, &TaskDisplay, app_cpu);
-  xTaskCreatePinnedToCore(Sleep, "SleepEsp32", 4096, NULL, configMAX_PRIORITIES-2, &TaskSleep, app_cpu);
+    xTaskCreatePinnedToCore(Humedad, "ReadDHT", 4096, NULL, configMAX_PRIORITIES-1, &TaskHumedad, app_cpu);
+    xTaskCreatePinnedToCore(LED, "HighLED", 1024, NULL, configMAX_PRIORITIES-1, &TaskLED, app_cpu);
+    xTaskCreatePinnedToCore(LUZ, "ReadLUZ", 1024, NULL, configMAX_PRIORITIES-1, &TaskLUZ, app_cpu);
+    xTaskCreatePinnedToCore(DisplayData, "ReadDHT", 4096, NULL, configMAX_PRIORITIES-1, &TaskDisplay, app_cpu);
+    xTaskCreatePinnedToCore(Sleep, "SleepEsp32", 1024, NULL, configMAX_PRIORITIES-2, &TaskSleep, app_cpu);
 }
 
-void loop() {}
+void loop() {}  // Las tareas se manejan por FreeRTOS
+
+// Implementación de Tareas ===================================================
 
 /**
- * @brief Tarea para leer la temperatura del sensor DHT11.
+ * @brief Tarea: Lectura de temperatura
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Lee sensor DHT11 cada 2.3s
+ * - Activa alarmas en fallos de lectura
+ * - Formatea valor a cadena (TT.TT)
  */
 void Temperatura(void *parameter) {
-  while (1) {
-    Cadena.ValueTemperatura = dht.readTemperature();
-    vTaskDelay(rate_Temperatura / portTICK_PERIOD_MS);
-  }
+    while(1) {
+        Cadena.ValueTemperatura = dht.readTemperature();
+        
+        // Gestión de errores
+        if (isnan(Cadena.ValueTemperatura)) {
+            digitalWrite(pinAlarma, HIGH);
+            digitalWrite(pinLedAlarma, HIGH);
+        } else {
+            digitalWrite(pinAlarma, LOW);
+            digitalWrite(pinLedAlarma, LOW);
+        }
+        
+        // Formateo a 2 decimales
+        sprintf(Cadena.temp, "%02d.%02d", 
+               (int)Cadena.ValueTemperatura, 
+               (int)(Cadena.ValueTemperatura * 100) % 100);
+        
+        vTaskDelay(rate_Temperatura / portTICK_PERIOD_MS);
+    }
 }
 
 /**
- * @brief Tarea para leer la humedad del sensor DHT11.
+ * @brief Tarea: Lectura de humedad
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Lee sensor DHT11 cada 2.6s
+ * - Activa alarmas en fallos de lectura
+ * - Formatea valor a cadena (HH.HH)
  */
 void Humedad(void *parameter) {
-  while (1) {
-    Cadena.ValueHumedad = dht.readHumidity();
-    vTaskDelay(rate_Humedad / portTICK_PERIOD_MS);
-  }
+    while(1) {
+        Cadena.ValueHumedad = dht.readHumidity();
+        
+        if (isnan(Cadena.ValueHumedad)) {
+            digitalWrite(pinAlarma, HIGH);
+            digitalWrite(pinLedAlarma, HIGH);
+        } else {
+            digitalWrite(pinAlarma, LOW);
+            digitalWrite(pinLedAlarma, LOW);
+        }
+        
+        sprintf(Cadena.hum, "%02d.%02d", 
+               (int)Cadena.ValueHumedad, 
+               (int)(Cadena.ValueHumedad * 100) % 100);
+        
+        vTaskDelay(rate_Humedad / portTICK_PERIOD_MS);
+    }
 }
 
 /**
- * @brief Tarea para hacer parpadear un LED.
+ * @brief Tarea: Control LED estado
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Parpadeo cada 500ms
+ * - Indicador visual de sistema activo
  */
 void LED(void *parameter) {
-  while (1) {
-    digitalWrite(pinLed, HIGH);
-    vTaskDelay(rate_LED / portTICK_PERIOD_MS);
-    digitalWrite(pinLed, LOW);
-    vTaskDelay(rate_LED / portTICK_PERIOD_MS);
-  }
+    while(1) {
+        digitalWrite(pinLed, HIGH);
+        vTaskDelay(rate_LED / portTICK_PERIOD_MS);
+        digitalWrite(pinLed, LOW);  
+        vTaskDelay(rate_LED / portTICK_PERIOD_MS);
+    }
 }
 
 /**
- * @brief Tarea para leer la luz ambiente.
+ * @brief Tarea: Lectura de luminosidad
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Lee valor analógico del LDR cada 1.7s
+ * - Formatea a 4 dígitos (0-4095)
  */
 void LUZ(void *parameter) {
-  while (1) {
-    Cadena.ValueLuz = analogRead(PinLuz);
-    vTaskDelay(rate_LUZ / portTICK_PERIOD_MS);
-  }
+    while(1) {
+        Cadena.ValueLuz = analogRead(PinLuz);
+        sprintf(Cadena.luz, "%04d", Cadena.ValueLuz);
+        vTaskDelay(rate_LUZ / portTICK_PERIOD_MS);
+    }
 }
 
 /**
- * @brief Tarea para administrar el modo de sueño del ESP32.
+ * @brief Tarea: Gestión de energía
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Implementa modo Light Sleep
+ * - Wakeup sources:
+ *   - Timer (10s)
+ *   - Pulsador (EXT0)
+ *   - Sensor IR (EXT1)
  */
 void Sleep(void *parameter) {
-  while (1) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    esp_light_sleep_start();
-  }
+    while(1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        // Configurar fuentes de wakeup
+        esp_sleep_enable_timer_wakeup(10 * 1000000);
+        esp_sleep_enable_ext0_wakeup(gpio_num_t(PinBoton), LOW);
+        esp_sleep_enable_ext1_wakeup((1ULL << PinInfra), ESP_EXT1_WAKEUP_ALL_LOW);
+        
+        esp_light_sleep_start();
+        
+        // Procesar causa de wakeup
+        esp_sleep_wakeup_cause_t causa = esp_sleep_get_wakeup_cause();
+        
+        if (causa == ESP_SLEEP_WAKEUP_EXT1) {
+            portENTER_CRITICAL(&mux);
+            contadorInfra++;
+            portEXIT_CRITICAL(&mux);
+        }
+        
+        if (causa == ESP_SLEEP_WAKEUP_EXT0) {
+            portENTER_CRITICAL(&mux);
+            contadorBoton++;
+            portEXIT_CRITICAL(&mux);
+        }
+    }
 }
 
 /**
- * @brief Tarea para mostrar los datos de los sensores en el monitor serie.
+ * @brief Tarea: Formateo y envío de datos
+ * @param parameter Parámetros de entrada (no usado)
+ * 
+ * - Actualiza valores del RTC
+ * - Formatea trama de datos
+ * - Envía por serial cada 10s
+ * - Notifica a tarea Sleep
  */
 void DisplayData(void *parameter) {
-  while (1) {
-    DateTime now = rtc.now();
-    Serial.println("Datos de sensores");
-    Serial.print("Fecha: "); Serial.println(now.timestamp());
-    Serial.print("Temperatura: "); Serial.println(Cadena.ValueTemperatura);
-    Serial.print("Humedad: "); Serial.println(Cadena.ValueHumedad);
-    vTaskDelay(rate_DISplay / portTICK_PERIOD_MS);
-  }
+    while(1) {
+        // Actualizar tiempo
+        DateTime now = rtc.now();
+        Cadena.year = now.year();
+        Cadena.month = now.month();
+        Cadena.day = now.day();
+        Cadena.hour = now.hour();
+        Cadena.minute = now.minute();
+        Cadena.second = now.second();
+        
+        // Formatear cadenas
+        sprintf(Cadena.date, "%02d/%02d/%04d", Cadena.day, Cadena.month, Cadena.year);
+        sprintf(Cadena.time, "%02d:%02d:%02d", Cadena.hour, Cadena.minute, Cadena.second);
+        sprintf(Cadena.contadorBotonStr, "%04d", contadorBoton);
+        sprintf(Cadena.contadorInfraStr, "%04d", contadorInfra);
+        
+        // Mostrar datos por serial
+        Serial.println("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
+        Serial.print("Fecha: "); Serial.print(Cadena.date);
+        Serial.print("  Hora: "); Serial.println(Cadena.time);
+        Serial.print("Humedad: "); Serial.print(Cadena.hum); Serial.print("%%");
+        Serial.print("||Temp: "); Serial.print(Cadena.temp); Serial.print("°C");
+        Serial.print("||Luz: "); Serial.println(Cadena.luz);
+        Serial.println("----------------------------------------------------------");
+        Serial.print("Pulsaciones: "); Serial.print(Cadena.contadorBotonStr);
+        Serial.print("||IR: "); Serial.println(Cadena.contadorInfraStr);
+        Serial.println("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%");
+        
+        // Enviar trama
+        Serial.print("$$");
+        Serial.print(Cadena.date); Serial.print(",");
+        Serial.print(Cadena.time); Serial.print(",");
+        Serial.print(Cadena.hum); Serial.print(",");
+        Serial.print(Cadena.temp); Serial.print(",");
+        Serial.print(Cadena.luz); Serial.print(",");
+        Serial.print(Cadena.contadorBotonStr); Serial.print(",");
+        Serial.print(Cadena.contadorInfraStr);
+        Serial.println("$$");
+        
+        vTaskDelay(rate_DISplay / portTICK_PERIOD_MS);
+        xTaskNotifyGive(TaskSleep);  // Reactivar tarea Sleep
+    }
 }
